@@ -28,8 +28,6 @@ from ppdet.modeling.ops import get_static_shape
 from ppdet.modeling.layers import MultiClassNMS
 
 __all__ = ['EffiDeHead', 'EffiDeHead_distill_ns', 'EffiDeHead_fuseab']
-
-
 @register
 class EffiDeHead(nn.Layer):
     __shared__ = [
@@ -47,8 +45,8 @@ class EffiDeHead(nn.Layer):
             grid_cell_offset=0.5,
             anchors=1,
             reg_max=16,  # reg_max=0 if use_dfl is False
-            use_dfl=True,  # False in n/s version, True in m/l version
-            static_assigner_epoch=4,  # warmup_epoch
+            use_dfl=False,  # False in n/s version, True in m/l version
+            static_assigner_epoch=0,  # warmup_epoch
             static_assigner='ATSSAssigner',
             assigner='TaskAlignedAssigner',
             eval_size=None,
@@ -94,7 +92,6 @@ class EffiDeHead(nn.Layer):
         if iou_type == 'siou':
             self.iou_loss = SIoULoss()
         self.loss_weight = loss_weight
-
         self.nms = nms
         if isinstance(self.nms, MultiClassNMS) and trt:
             self.nms.trt = trt
@@ -133,13 +130,12 @@ class EffiDeHead(nn.Layer):
         self.reg_max = reg_max
         self.proj_conv = nn.Conv2D(self.reg_max + 1, 1, 1, bias_attr=False)
         self.proj_conv.skip_quant = True
-
         self.proj = paddle.linspace(0, self.reg_max, self.reg_max + 1)
         self.proj_conv.weight.set_value(
             self.proj.reshape([1, self.reg_max + 1, 1, 1]))
         self.proj_conv.weight.stop_gradient = True
 
-        # self._init_weights()
+        self._init_weights()
         self.print_l1_loss = print_l1_loss
 
     @classmethod
@@ -148,12 +144,12 @@ class EffiDeHead(nn.Layer):
 
     def _init_weights(self):
         bias_cls = bias_init_with_prob(0.01)
-        for cls_, reg_ in zip(self.pred_cls, self.pred_reg):
-            constant_(cls_[-1].weight)
-            constant_(cls_[-1].bias, bias_cls)
-            constant_(reg_[-1].weight)
-            constant_(reg_[-1].bias, 1.0)
-
+        for cls_, reg_ in zip(self.cls_preds, self.reg_preds):
+            constant_(cls_.weight,0.0)
+            constant_(cls_.bias, bias_cls)
+            constant_(reg_.weight,0.0)
+            constant_(reg_.bias, 1.0)
+        
         self.proj = paddle.linspace(0, self.reg_max, self.reg_max + 1)
         self.proj_conv.weight.set_value(
             self.proj.reshape([1, self.reg_max + 1, 1, 1]))
@@ -178,6 +174,7 @@ class EffiDeHead(nn.Layer):
                 self.grid_cell_offset)
 
         cls_score_list, reg_distri_list = [], []
+
         for i, feat in enumerate(feats):
             feat = self.stems[i](feat)
             cls_x = feat
@@ -188,8 +185,9 @@ class EffiDeHead(nn.Layer):
             reg_output = self.reg_preds[i](reg_feat)
             # cls and reg
             cls_output = F.sigmoid(cls_output)
-            cls_score_list.append(cls_output.flatten(2).permute((0, 2, 1)))
-            reg_distri_list.append(reg_output.flatten(2).permute((0, 2, 1)))
+
+            cls_score_list.append(paddle.transpose(cls_output.flatten(2), perm=[0, 2, 1]))
+            reg_distri_list.append(paddle.transpose(reg_output.flatten(2), perm=[0, 2, 1]))
 
         cls_score_list = paddle.concat(cls_score_list, axis=1)
         reg_distri_list = paddle.concat(reg_distri_list, axis=1)
@@ -254,7 +252,7 @@ class EffiDeHead(nn.Layer):
     def _varifocal_loss(pred_score, gt_score, label, alpha=0.75, gamma=2.0):
         weight = alpha * pred_score.pow(gamma) * (1 - label) + gt_score * label
         loss = F.binary_cross_entropy(
-            pred_score, gt_score, weight=weight, reduction='sum')
+            paddle.cast(pred_score, 'float32'), paddle.cast(gt_score, 'float32'), weight=weight, reduction='sum')
         return loss
 
     def _bbox_decode(self, anchor_points, pred_dist):
@@ -262,8 +260,7 @@ class EffiDeHead(nn.Layer):
         if self.use_dfl:
             b, l, _ = get_static_shape(pred_dist)
             pred_dist = F.softmax(
-                pred_dist.reshape([b, l, 4, self.reg_max + 1])).matmul(
-                    self.proj)
+                pred_dist.reshape([b, l, 4, self.reg_max + 1])).matmul(self.proj.reshape((-1, 1))).squeeze()
         return batch_distance2bbox(anchor_points, pred_dist)
 
     def _bbox2distance(self, points, bbox):
@@ -327,18 +324,19 @@ class EffiDeHead(nn.Layer):
         return loss_l1, loss_iou, loss_dfl
 
     def get_loss(self, head_outs, gt_meta):
-        pred_scores, pred_distri, anchors,\
+        pred_scores, pred_distri, anchors, \
         anchor_points, num_anchors_list, stride_tensor = head_outs
 
         anchor_points_s = anchor_points / stride_tensor
         pred_bboxes = self._bbox_decode(anchor_points_s, pred_distri)
 
         gt_labels = gt_meta['gt_class']
-        gt_bboxes = gt_meta['gt_bbox']
-        pad_gt_mask = gt_meta['pad_gt_mask']
+        gt_bboxes = gt_meta['gt_bbox']   # xyxy
+        pad_gt_mask = paddle.cast((gt_bboxes.sum(-1, keepdim=True) > 0), 'float32')
+
         # label assignment
         if gt_meta['epoch_id'] < self.static_assigner_epoch:
-            assigned_labels, assigned_bboxes, assigned_scores = \
+            assigned_labels, assigned_bboxes, assigned_scores, fg_mask = \
                 self.static_assigner(
                     anchors,
                     num_anchors_list,
@@ -348,62 +346,68 @@ class EffiDeHead(nn.Layer):
                     bg_index=self.num_classes,
                     pred_bboxes=pred_bboxes.detach() * stride_tensor)
         else:
-            assigned_labels, assigned_bboxes, assigned_scores = \
+            assigned_labels, assigned_bboxes, assigned_scores, fg_mask = \
                 self.assigner(
-                pred_scores.detach(),
-                pred_bboxes.detach() * stride_tensor,
-                anchor_points,
-                num_anchors_list,
-                gt_labels,
-                gt_bboxes,
-                pad_gt_mask,
-                bg_index=self.num_classes)
+                    pred_scores.detach(),
+                    pred_bboxes.detach() * stride_tensor,
+                    anchor_points,
+                    num_anchors_list,
+                    gt_labels,
+                    gt_bboxes,
+                    pad_gt_mask,
+                    bg_index=self.num_classes)
+
         # rescale bbox
         assigned_bboxes /= stride_tensor
 
         # cls loss: varifocal_loss
+        assigned_labels = paddle.where(fg_mask > 0, assigned_labels,
+                                       paddle.full_like(assigned_labels, self.num_classes))
+        assigned_labels = paddle.cast(assigned_labels, 'int64')
         one_hot_label = F.one_hot(assigned_labels,
                                   self.num_classes + 1)[..., :-1]
+
         loss_cls = self._varifocal_loss(pred_scores, assigned_scores,
                                         one_hot_label)
+
         assigned_scores_sum = assigned_scores.sum()
         if paddle.distributed.get_world_size() > 1:
             paddle.distributed.all_reduce(assigned_scores_sum)
             assigned_scores_sum = paddle.clip(
                 assigned_scores_sum / paddle.distributed.get_world_size(),
                 min=1)
+        
         loss_cls /= assigned_scores_sum
-
         # bbox loss
         loss_l1, loss_iou, loss_dfl = \
             self._bbox_loss(pred_distri, pred_bboxes, anchor_points_s,
                             assigned_labels, assigned_bboxes, assigned_scores,
                             assigned_scores_sum)
-
         if self.use_dfl:
             loss = self.loss_weight['cls'] * loss_cls + \
-                self.loss_weight['iou'] * loss_iou + \
-                self.loss_weight['dfl'] * loss_dfl
+                   self.loss_weight['iou'] * loss_iou + \
+                   self.loss_weight['dfl'] * loss_dfl
             num_gpus = gt_meta.get('num_gpus', 8)
             out_dict = {
                 'loss': loss * num_gpus,
-                'loss_cls': loss_cls,
-                'loss_iou': loss_iou,
+                'loss_cls': self.loss_weight['cls']*loss_cls,
+                'loss_iou': self.loss_weight['iou']*loss_iou,
                 'loss_dfl': loss_dfl,
             }
         else:
             loss = self.loss_weight['cls'] * loss_cls + \
-                self.loss_weight['iou'] * loss_iou
+                   self.loss_weight['iou'] * loss_iou
             num_gpus = gt_meta.get('num_gpus', 8)
             out_dict = {
                 'loss': loss * num_gpus,
-                'loss_cls': loss_cls,
-                'loss_iou': loss_iou,
+                'loss_cls': self.loss_weight['cls']*loss_cls,
+                'loss_iou': self.loss_weight['iou']*loss_iou,
             }
-
+        
         if self.print_l1_loss:
             # just see convergence
             out_dict.update({'loss_l1': loss_l1})
+
         return out_dict
 
     def post_process(self, head_outs, im_shape, scale_factor):
@@ -492,7 +496,6 @@ class EffiDeHead_distill_ns(EffiDeHead):
         if iou_type == 'siou':
             self.iou_loss = SIoULoss()
         self.loss_weight = loss_weight
-
         self.nms = nms
         if isinstance(self.nms, MultiClassNMS) and trt:
             self.nms.trt = trt
@@ -541,7 +544,7 @@ class EffiDeHead_distill_ns(EffiDeHead):
             self.proj.reshape([1, self.reg_max + 1, 1, 1]))
         self.proj_conv.weight.stop_gradient = True
 
-        # self._init_weights()
+        self._init_weights()
         self.print_l1_loss = print_l1_loss
 
     @classmethod
@@ -550,7 +553,7 @@ class EffiDeHead_distill_ns(EffiDeHead):
 
     def _init_weights(self):
         bias_cls = bias_init_with_prob(0.01)
-        for cls_, reg_ in zip(self.pred_cls, self.pred_reg):
+        for cls_, reg_ in zip(self.cls_preds, self.reg_preds):
             constant_(cls_[-1].weight)
             constant_(cls_[-1].bias, bias_cls)
             constant_(reg_[-1].weight)
@@ -591,9 +594,9 @@ class EffiDeHead_distill_ns(EffiDeHead):
             reg_output_lrtb = self.reg_preds_lrtb[i](reg_feat)
             # cls and reg
             cls_output = F.sigmoid(cls_output)
-            cls_score_list.append(cls_output.flatten(2).permute((0, 2, 1)))
-            reg_distri_list.append(reg_output.flatten(2).permute((0, 2, 1)))
-            reg_lrtb_list.append(reg_output_lrtb.flatten(2).permute((0, 2, 1)))
+            cls_score_list.append(paddle.transpose(cls_output.flatten(2), perm=[0, 2, 1]))
+            reg_distri_list.append(paddle.transpose(reg_output.flatten(2), perm=[0, 2, 1]))
+            reg_lrtb_list.append(paddle.transpose(reg_output_lrtb.flatten(2), perm=[0, 2, 1]))
 
         cls_score_list = paddle.concat(cls_score_list, axis=1)
         reg_distri_list = paddle.concat(reg_distri_list, axis=1)
@@ -629,18 +632,17 @@ class EffiDeHead_distill_ns(EffiDeHead):
         return cls_score_list, reg_lrtb_list, anchor_points, stride_tensor
 
     def get_loss(self, head_outs, gt_meta):
-        pred_scores, pred_distri, pred_ltbrs, anchors,\
+        pred_scores, pred_distri, pred_ltbrs, anchors, \
         anchor_points, num_anchors_list, stride_tensor = head_outs
 
         anchor_points_s = anchor_points / stride_tensor
         pred_bboxes = self._bbox_decode(anchor_points_s, pred_distri)
-
         gt_labels = gt_meta['gt_class']
         gt_bboxes = gt_meta['gt_bbox']
-        pad_gt_mask = gt_meta['pad_gt_mask']
+        pad_gt_mask = paddle.cast((gt_bboxes.sum(-1, keepdim=True) > 0), 'float32')
         # label assignment
         if gt_meta['epoch_id'] < self.static_assigner_epoch:
-            assigned_labels, assigned_bboxes, assigned_scores = \
+            assigned_labels, assigned_bboxes, assigned_scores, fg_mask = \
                 self.static_assigner(
                     anchors,
                     num_anchors_list,
@@ -650,20 +652,23 @@ class EffiDeHead_distill_ns(EffiDeHead):
                     bg_index=self.num_classes,
                     pred_bboxes=pred_bboxes.detach() * stride_tensor)
         else:
-            assigned_labels, assigned_bboxes, assigned_scores = \
+            assigned_labels, assigned_bboxes, assigned_scores, fg_mask = \
                 self.assigner(
-                pred_scores.detach(),
-                pred_bboxes.detach() * stride_tensor,
-                anchor_points,
-                num_anchors_list,
-                gt_labels,
-                gt_bboxes,
-                pad_gt_mask,
-                bg_index=self.num_classes)
+                    pred_scores.detach(),
+                    pred_bboxes.detach() * stride_tensor,
+                    anchor_points,
+                    num_anchors_list,
+                    gt_labels,
+                    gt_bboxes,
+                    pad_gt_mask,
+                    bg_index=self.num_classes)
         # rescale bbox
         assigned_bboxes /= stride_tensor
 
         # cls loss: varifocal_loss
+        assigned_labels = paddle.where(fg_mask > 0, assigned_labels,
+                                       paddle.full_like(assigned_labels, self.num_classes))
+        assigned_labels = paddle.cast(assigned_labels, 'int64')
         one_hot_label = F.one_hot(assigned_labels,
                                   self.num_classes + 1)[..., :-1]
         loss_cls = self._varifocal_loss(pred_scores, assigned_scores,
@@ -681,11 +686,10 @@ class EffiDeHead_distill_ns(EffiDeHead):
             self._bbox_loss(pred_distri, pred_bboxes, anchor_points_s,
                             assigned_labels, assigned_bboxes, assigned_scores,
                             assigned_scores_sum)
-
         if self.use_dfl:
             loss = self.loss_weight['cls'] * loss_cls + \
-                self.loss_weight['iou'] * loss_iou + \
-                self.loss_weight['dfl'] * loss_dfl
+                   self.loss_weight['iou'] * loss_iou + \
+                   self.loss_weight['dfl'] * loss_dfl
             num_gpus = gt_meta.get('num_gpus', 8)
             out_dict = {
                 'loss': loss * num_gpus,
@@ -695,7 +699,7 @@ class EffiDeHead_distill_ns(EffiDeHead):
             }
         else:
             loss = self.loss_weight['cls'] * loss_cls + \
-                self.loss_weight['iou'] * loss_iou
+                   self.loss_weight['iou'] * loss_iou
             num_gpus = gt_meta.get('num_gpus', 8)
             out_dict = {
                 'loss': loss * num_gpus,
@@ -823,7 +827,7 @@ class EffiDeHead_fuseab(EffiDeHead):
             self.proj.reshape([1, self.reg_max + 1, 1, 1]))
         self.proj_conv.weight.stop_gradient = True
 
-        # self._init_weights()
+        self._init_weights()
         self.print_l1_loss = print_l1_loss
 
     @classmethod
@@ -832,7 +836,7 @@ class EffiDeHead_fuseab(EffiDeHead):
 
     def _init_weights(self):
         bias_cls = bias_init_with_prob(0.01)
-        for cls_, reg_ in zip(self.pred_cls, self.pred_reg):
+        for cls_, reg_ in zip(self.cls_preds, self.reg_preds):
             constant_(cls_[-1].weight)
             constant_(cls_[-1].bias, bias_cls)
             constant_(reg_[-1].weight)
@@ -873,9 +877,9 @@ class EffiDeHead_fuseab(EffiDeHead):
             reg_output_lrtb = self.reg_preds_lrtb[i](reg_feat)
             # cls and reg
             cls_output = F.sigmoid(cls_output)
-            cls_score_list.append(cls_output.flatten(2).permute((0, 2, 1)))
-            reg_distri_list.append(reg_output.flatten(2).permute((0, 2, 1)))
-            reg_lrtb_list.append(reg_output_lrtb.flatten(2).permute((0, 2, 1)))
+            cls_score_list.append(paddle.transpose(cls_output.flatten(2), perm=[0, 2, 1]))
+            reg_distri_list.append(paddle.transpose(reg_output.flatten(2), perm=[0, 2, 1]))
+            reg_lrtb_list.append(paddle.transpose(reg_output_lrtb.flatten(2), perm=[0, 2, 1]))
 
         cls_score_list = paddle.concat(cls_score_list, axis=1)
         reg_distri_list = paddle.concat(reg_distri_list, axis=1)
@@ -911,7 +915,7 @@ class EffiDeHead_fuseab(EffiDeHead):
         return cls_score_list, reg_lrtb_list, anchor_points, stride_tensor
 
     def get_loss(self, head_outs, gt_meta):
-        pred_scores, pred_distri, pred_ltbrs, anchors,\
+        pred_scores, pred_distri, pred_ltbrs, anchors, \
         anchor_points, num_anchors_list, stride_tensor = head_outs
 
         anchor_points_s = anchor_points / stride_tensor
@@ -919,10 +923,10 @@ class EffiDeHead_fuseab(EffiDeHead):
 
         gt_labels = gt_meta['gt_class']
         gt_bboxes = gt_meta['gt_bbox']
-        pad_gt_mask = gt_meta['pad_gt_mask']
+        pad_gt_mask = paddle.cast((gt_bboxes.sum(-1, keepdim=True) > 0), 'float32')
         # label assignment
         if gt_meta['epoch_id'] < self.static_assigner_epoch:
-            assigned_labels, assigned_bboxes, assigned_scores = \
+            assigned_labels, assigned_bboxes, assigned_scores, fg_mask = \
                 self.static_assigner(
                     anchors,
                     num_anchors_list,
@@ -932,20 +936,23 @@ class EffiDeHead_fuseab(EffiDeHead):
                     bg_index=self.num_classes,
                     pred_bboxes=pred_bboxes.detach() * stride_tensor)
         else:
-            assigned_labels, assigned_bboxes, assigned_scores = \
+            assigned_labels, assigned_bboxes, assigned_scores, fg_mask = \
                 self.assigner(
-                pred_scores.detach(),
-                pred_bboxes.detach() * stride_tensor,
-                anchor_points,
-                num_anchors_list,
-                gt_labels,
-                gt_bboxes,
-                pad_gt_mask,
-                bg_index=self.num_classes)
+                    pred_scores.detach(),
+                    pred_bboxes.detach() * stride_tensor,
+                    anchor_points,
+                    num_anchors_list,
+                    gt_labels,
+                    gt_bboxes,
+                    pad_gt_mask,
+                    bg_index=self.num_classes)
         # rescale bbox
         assigned_bboxes /= stride_tensor
 
         # cls loss: varifocal_loss
+        assigned_labels = paddle.where(fg_mask > 0, assigned_labels,
+                                       paddle.full_like(assigned_labels, self.num_classes))
+        assigned_labels = paddle.cast(assigned_labels, 'int64')
         one_hot_label = F.one_hot(assigned_labels,
                                   self.num_classes + 1)[..., :-1]
         loss_cls = self._varifocal_loss(pred_scores, assigned_scores,
@@ -966,8 +973,8 @@ class EffiDeHead_fuseab(EffiDeHead):
 
         if self.use_dfl:
             loss = self.loss_weight['cls'] * loss_cls + \
-                self.loss_weight['iou'] * loss_iou + \
-                self.loss_weight['dfl'] * loss_dfl
+                   self.loss_weight['iou'] * loss_iou + \
+                   self.loss_weight['dfl'] * loss_dfl
             num_gpus = gt_meta.get('num_gpus', 8)
             out_dict = {
                 'loss': loss * num_gpus,
@@ -977,7 +984,7 @@ class EffiDeHead_fuseab(EffiDeHead):
             }
         else:
             loss = self.loss_weight['cls'] * loss_cls + \
-                self.loss_weight['iou'] * loss_iou
+                   self.loss_weight['iou'] * loss_iou
             num_gpus = gt_meta.get('num_gpus', 8)
             out_dict = {
                 'loss': loss * num_gpus,
